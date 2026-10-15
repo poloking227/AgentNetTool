@@ -236,6 +236,25 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
         }
     };
 
+    const handleReprocessRecording = async (recordingName: string) => {
+        try {
+            const response = await fetch(
+                `http://localhost:5328/api/recording/${recordingName}/reprocess`,
+                { method: "POST" }
+            );
+            const result = await response.json();
+            if (response.ok) {
+                showInfo("Processing restarted, finished parts are reused");
+            } else {
+                showError(result.message);
+            }
+        } catch (error) {
+            showError("Network error or server is down.");
+        } finally {
+            fetchTasks();
+        }
+    };
+
     const handleDeleteVerifyRecording = async (
         recordingName: string,
         taskName: string
@@ -511,7 +530,9 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
                                             >
                                                 <ListItemButton className="flex flex-row justify-between w-full">
                                                     {recording.status ===
-                                                    "processing" ? (
+                                                        "processing" ||
+                                                    recording.status ===
+                                                        "recording" ? (
                                                         <div
                                                             style={{
                                                                 maxWidth: "80%",
@@ -533,7 +554,47 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
                                                                 }
                                                             </p>
                                                             <p className="text-[10px] text-gray-400">
-                                                                Processing...
+                                                                {recording.status ===
+                                                                "recording"
+                                                                    ? "Recording..."
+                                                                    : "Processing..."}
+                                                            </p>
+                                                        </div>
+                                                    ) : recording.status ===
+                                                          "interrupted" ||
+                                                      recording.status ===
+                                                          "failed" ? (
+                                                        <div
+                                                            style={{
+                                                                maxWidth: "80%",
+                                                            }}
+                                                            className="flex flex-col gap-0"
+                                                        >
+                                                            <p className="text-sm font-semibold text-zinc-600 truncate dark:text-zinc-400">
+                                                                {
+                                                                    recording.task_name
+                                                                }
+                                                            </p>
+                                                            <p className="text-[10px] text-amber-600 truncate dark:text-amber-400">
+                                                                {recording.status ===
+                                                                "interrupted"
+                                                                    ? "Processing interrupted"
+                                                                    : "Processing failed"}
+                                                                {" · "}
+                                                                <span
+                                                                    role="button"
+                                                                    className="underline cursor-pointer"
+                                                                    onClick={() =>
+                                                                        handleReprocessRecording(
+                                                                            recording.name
+                                                                        )
+                                                                    }
+                                                                >
+                                                                    {recording.status ===
+                                                                    "interrupted"
+                                                                        ? "Resume"
+                                                                        : "Retry"}
+                                                                </span>
                                                             </p>
                                                         </div>
                                                     ) : recording.visualizable ? (

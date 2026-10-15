@@ -224,6 +224,9 @@ export const MainProvider: React.FC<{ children: ReactNode }> = ({
     useEffect(() => {
         SocketService.Listen("reduced", (response) => {
             console.log("reduced");
+            if (response?.status === "failed") {
+                showError("Recording processing failed, retry it from the sidebar");
+            }
             setTimeout(() => {
                 fetchTasks();
             }, 1500);

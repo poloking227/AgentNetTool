@@ -17,12 +17,14 @@ if __name__ == "__main__":
         wrap_func_key,
     )
     from api.core.logger import logger
+    from api.core.processing_state import fsync_path, replace_file
 else:
     from .reduction_helper import (
         MODIFIED_KEYS, MOUSE_LONG_PRESS_INTERVAL,
         wrap_func_key,
     )
     from ..logger import logger
+    from ..processing_state import fsync_path, replace_file
 
 
 class ActionBuilder:
@@ -275,6 +277,9 @@ class Action:
                 attempt += 1
                 time.sleep(1)
 
+        if cap is None or not cap.isOpened():
+            raise IOError(f"Cannot open video {video_path}")
+
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -285,7 +290,13 @@ class Action:
         output_path = os.path.join(
             recording_path, "video_clips", f"{video_clip_name}.mp4"
         )
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        # Write under a temporary name (still ending in .mp4, OpenCV picks the
+        # container from it) and rename when complete, so that after a crash
+        # every {id}_{action}.mp4 present is a finished clip.
+        part_path = os.path.join(
+            recording_path, "video_clips", f"{video_clip_name}.part.mp4"
+        )
+        out = cv2.VideoWriter(part_path, fourcc, fps, (width, height))
         video_attrs.update(
             {
                 "fps": fps,
@@ -295,14 +306,21 @@ class Action:
             }
         )
 
-        self.process_video_segment(
-            start_time,
-            end_time,
-            cap,
-            out,
-            video_attrs=video_attrs,
-            window_attrs=window_attrs,
-        )
+        try:
+            self.process_video_segment(
+                start_time,
+                end_time,
+                cap,
+                out,
+                video_attrs=video_attrs,
+                window_attrs=window_attrs,
+            )
+        finally:
+            cap.release()
+            out.release()
+
+        fsync_path(part_path)
+        replace_file(part_path, output_path)
 
     def process_video_segment(
         self, start_time, end_time, cap, out, video_attrs: dict, window_attrs: dict

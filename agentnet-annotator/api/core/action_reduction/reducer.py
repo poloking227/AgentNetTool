@@ -7,7 +7,7 @@ import threading
 import queue
 import platform
 import ctypes
-import re
+import hashlib
 from pathlib import Path
 import shutil
 
@@ -54,6 +54,10 @@ if __name__ == "__main__":
         write_encrypted_jsonl,
         read_encrypted_jsonl,
     )
+    from api.core.processing_state import (
+        STAGE_CLIPS, STAGE_DUMP, STAGE_MATCH, STAGE_REDUCE,
+        atomic_write_text, fsync_path, write_state,
+    )
 else:
     from .action import *
     from .reduction_helper import *
@@ -67,6 +71,13 @@ else:
         write_encrypt_line,
         write_encrypted_json,
     )
+    from ..processing_state import (
+        STAGE_CLIPS, STAGE_DUMP, STAGE_MATCH, STAGE_REDUCE,
+        atomic_write_text, fsync_path, write_state,
+    )
+
+
+GPT_TARGETS_CACHE_FILE = "gpt_targets_cache.json"
 
 
 class Reducer:
@@ -675,7 +686,41 @@ class Reducer:
 
         logger.error(f"finish {len(self.reduced_actions)}")
 
+    def _clip_plan_fingerprint(self, video_attrs):
+        """Fingerprint of the clips to cut; clips left from an earlier run are only
+        reused when it matches."""
+        plan = [
+            (
+                action.id,
+                action.action,
+                round(action._get_video_start_time(), 4),
+                round(action._get_video_end_time(), 4),
+            )
+            for action in self.reduced_actions
+        ]
+        plan.append(round(video_attrs["video_start_time"], 4))
+        return hashlib.sha1(json.dumps(plan).encode("utf-8")).hexdigest()
+
+    def _prepare_clips_dir(self, video_attrs, previous_fingerprint):
+        clips_dir = os.path.join(self.recording_path, "video_clips")
+        fingerprint = self._clip_plan_fingerprint(video_attrs)
+        if previous_fingerprint != fingerprint and os.path.isdir(clips_dir):
+            logger.info("Reducer: clip plan changed, discarding existing clips")
+            shutil.rmtree(clips_dir)
+        os.makedirs(clips_dir, exist_ok=True)
+        # Clips that were being written when the processing got interrupted
+        for file_name in os.listdir(clips_dir):
+            if file_name.endswith(".part.mp4"):
+                os.remove(os.path.join(clips_dir, file_name))
+        return fingerprint
+
     def process_actions_multithreaded(self, recording_path, video_attrs, window_attrs):
+        clips_dir = os.path.join(recording_path, "video_clips")
+
+        def clip_done(action):
+            clip_path = os.path.join(clips_dir, f"{action.id}_{action.action}.mp4")
+            return os.path.exists(clip_path) and os.path.getsize(clip_path) > 0
+
         def process_action(action, recording_path, video_attrs, window_attrs):
             action.to_video(
                 recording_path=recording_path,
@@ -686,22 +731,34 @@ class Reducer:
         threads = []
         max_threads = 8
         q = queue.Queue()
+        failed = []
 
-        # Enqueue all actions
-        for action in self.reduced_actions:
+        # Enqueue the actions whose clip isn't there yet (resume after a crash)
+        todo = [action for action in self.reduced_actions if not clip_done(action)]
+        logger.info(
+            f"Reducer: {len(self.reduced_actions) - len(todo)} clips already done, "
+            f"{len(todo)} to cut"
+        )
+        for action in todo:
             q.put(action)
 
         # Function to process actions from the queue
         def worker():
-            while not q.empty():
-                action = q.get()
-                if action is None:
+            while True:
+                try:
+                    action = q.get_nowait()
+                except queue.Empty:
                     break
-                process_action(action, recording_path, video_attrs, window_attrs)
-                q.task_done()
+                try:
+                    process_action(action, recording_path, video_attrs, window_attrs)
+                except Exception as e:
+                    logger.exception(f"Reducer: clip {action.id} failed: {e}")
+                    failed.append(action.id)
+                finally:
+                    q.task_done()
 
         # Start initial batch of threads
-        for _ in range(min(max_threads, len(self.reduced_actions))):
+        for _ in range(min(max_threads, len(todo))):
             thread = threading.Thread(target=worker)
             threads.append(thread)
             thread.start()
@@ -709,6 +766,9 @@ class Reducer:
         # Wait for all threads to finish
         for thread in threads:
             thread.join()
+
+        if failed:
+            raise RuntimeError(f"Failed to cut video clips for actions {sorted(failed)}")
 
     def _save_action(self, action):
         action.complete_dump(recording_dir=self.recording_path)
@@ -853,9 +913,11 @@ class Reducer:
         html_data_path = os.path.join(self.recording_path, "html.jsonl")
         html_data = []
         if os.path.exists(html_data_path):
+            # Don't truncate html.jsonl here: it is rewritten (atomically) with the
+            # pruned data at the end, and a crash in between would lose it.
+            # Pruning keeps the nearest html before/after each action, so pruning
+            # already-pruned data again on resume yields the same result.
             html_data = read_encrypted_jsonl(html_data_path)
-            with open(html_data_path, "w", encoding="utf-8") as f:
-                pass
 
         saved_htmls = set()
 
@@ -949,7 +1011,7 @@ class Reducer:
 
         if len(need_gpt_list) > 0:
             try:
-                gpt_result = predict_targets(self.recording_path, need_gpt_list)
+                gpt_result = self._predict_targets_cached(need_gpt_list)
                 need_gpt_idx = [event["id"] for event in need_gpt_list]
 
                 for result, index in zip(gpt_result, need_gpt_idx):
@@ -968,10 +1030,40 @@ class Reducer:
                 logger.exception(f"Reducer: match_element: {str(e)}")
 
         # Save html info
-        saved_html_data = [html_data[idx] for idx in saved_htmls]
+        # Keep time order (a set doesn't): the lookups above assume sorted data
+        saved_html_data = [html_data[idx] for idx in sorted(saved_htmls)]
         write_encrypted_jsonl(
             os.path.join(self.recording_path, "html.jsonl"), data=saved_html_data
         )
+
+    def _predict_targets_cached(self, need_gpt_list):
+        """
+        predict_targets with results cached in the recording folder, so resuming
+        an interrupted processing doesn't call the model again for the same
+        actions (and gets the same answers).
+        """
+        cache_path = os.path.join(self.recording_path, GPT_TARGETS_CACHE_FILE)
+        cache = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            except (OSError, ValueError) as e:
+                logger.warning(f"Reducer: ignoring invalid gpt cache: {e}")
+
+        def _key(event):
+            return f"{event['id']}:{event['timestamp']}"
+
+        missing = [event for event in need_gpt_list if _key(event) not in cache]
+        if missing:
+            results = predict_targets(self.recording_path, missing)
+            for event, result in zip(missing, results):
+                cache[_key(event)] = result
+            atomic_write_text(cache_path, json.dumps(cache, ensure_ascii=False))
+        else:
+            logger.info("Reducer: all gpt targets taken from cache")
+
+        return [cache.get(_key(event)) for event in need_gpt_list]
 
     def match_axtree(self):
         def _find_pred(time_stamp, data):
@@ -1022,25 +1114,26 @@ class Reducer:
 
         self.reduced_actions = actions
 
-    def reduce_pipeline(self):
+    def reduce_pipeline(self, previous_state=None):
+        """
+        Turn the raw recording into reduced events and video clips.
+
+        Progress is written to processing_state.json. The pipeline can be rerun
+        on a recording whose processing was interrupted: the raw files are never
+        modified destructively, the reduction is recomputed (it is fast and
+        deterministic), model predictions come from a cache and clips that were
+        already cut are kept.
+
+        Raises on failure so that the caller can record it.
+        """
+        previous_state = previous_state or {}
+        start_time = time.perf_counter()
+        recording_path = self.recording_path
         try:
-            start_time = time.perf_counter()
-            recording_path = self.recording_path
+            write_state(recording_path, stage=STAGE_REDUCE)
             events = read_encrypted_jsonl(
                 path=os.path.join(recording_path, "events.jsonl")
             )
-
-            video_path = os.path.join(recording_path, "video_clips")
-            if os.path.exists(video_path):
-                if os.path.isdir(video_path):
-                    shutil.rmtree(video_path)
-                    os.makedirs(video_path, exist_ok=True)
-            if os.path.exists(os.path.join(recording_path, "reduced_events_vis.jsonl")):
-                os.remove(os.path.join(recording_path, "reduced_events_vis.jsonl"))
-            if os.path.exists(
-                os.path.join(recording_path, "reduced_events_complete.jsonl")
-            ):
-                os.remove(os.path.join(recording_path, "reduced_events_complete.jsonl"))
 
             self.compress(events)
             self.reduce_all()
@@ -1048,8 +1141,6 @@ class Reducer:
             self.finish()
 
             event_buffer_path = os.path.join(recording_path, "event_buffer.jsonl")
-            if os.path.exists(event_buffer_path):
-                os.remove(event_buffer_path)
             write_encrypted_jsonl(event_buffer_path, data=self.event_buffer)
 
             if self.flatten:
@@ -1058,14 +1149,14 @@ class Reducer:
             for i, action in enumerate(self.reduced_actions):
                 action.set_id(i)
 
-            # TODO: delete former video clips
-
+            write_state(recording_path, stage=STAGE_MATCH)
             if self.generate_window_a11y:
                 self.match_axtree()
             from platform import system
             if self.generate_element_a11y and system() != "Linux":
                 self.match_element()
 
+            write_state(recording_path, stage=STAGE_DUMP)
             self.complete_dump(recording_path)
             self.vis_dump(recording_path)
 
@@ -1073,6 +1164,24 @@ class Reducer:
                 metadata = json.load(f)
             video_start_time = metadata["video_start_timestamp"]
             video_attrs = {"video_start_time": video_start_time}
+
+            # The video comes from OBS; make sure it is on disk before relying on it
+            video_name = next(
+                (f for f in os.listdir(recording_path) if f.endswith(".mp4")), None
+            )
+            if video_name is None:
+                raise FileNotFoundError(f"No video found in {recording_path}")
+            fsync_path(os.path.join(recording_path, video_name))
+
+            fingerprint = self._prepare_clips_dir(
+                video_attrs, previous_state.get("clip_fingerprint")
+            )
+            write_state(
+                recording_path,
+                stage=STAGE_CLIPS,
+                clip_fingerprint=fingerprint,
+                total_clips=len(self.reduced_actions),
+            )
             time.sleep(1)
             self.process_actions_multithreaded(
                 recording_path=recording_path,
@@ -1087,6 +1196,7 @@ class Reducer:
 
         except Exception as e:
             logger.exception(f"reduce_pipeline failed: {str(e)}")
+            raise
 
 
 def visualize_recording(

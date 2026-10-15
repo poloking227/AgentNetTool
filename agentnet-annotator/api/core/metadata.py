@@ -5,6 +5,8 @@ from platform import uname
 
 from screeninfo import get_monitors
 
+from .processing_state import atomic_write_text
+
 
 class MetadataManager:
     """
@@ -49,8 +51,9 @@ class MetadataManager:
 
     def save_metadata(self):
         metadata_path = os.path.join(self.recording_path, "metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(self.metadata, f, indent=4, ensure_ascii=False)
+        atomic_write_text(
+            metadata_path, json.dumps(self.metadata, indent=4, ensure_ascii=False)
+        )
 
     def collect(self):
         self.metadata["start_time"] = self._get_time_stamp()

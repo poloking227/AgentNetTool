@@ -11,6 +11,7 @@ from pynput import keyboard, mouse
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .metadata import MetadataManager
+from .processing_state import fsync_fp
 from .obs_client import OBSClient, is_obs_recording, OBSAlreadyRecordingError
 from .utils import (
     fix_windows_dpi_scaling,
@@ -279,12 +280,20 @@ class Recorder(QThread):
                 self.obs_client.record_state_events
             )
 
-            self.events_file.close()
-            self.metadata_manager.save_metadata()
+            # Push the raw data all the way to disk: processing a long recording
+            # takes a while, and a crash during it must not take the raw data along.
+            raw_files = [self.events_file, self.html_file, self.top_window_file]
             if self.gen_window:
-                self.a11y_file.close()
-            if self.gen_element and system() != "Linux":
-                self.element_file.close()
+                raw_files.append(self.a11y_file)
+            if self.gen_element:
+                raw_files.append(self.element_file)
+            for raw_file in raw_files:
+                try:
+                    fsync_fp(raw_file)
+                except OSError as e:
+                    logger.warning(f"Recorder: fsync {raw_file.name} failed: {e}")
+                raw_file.close()
+            self.metadata_manager.save_metadata()
 
             # self.recording_stopped.emit()
         logger.info("Recorder: stop_recording done.")
