@@ -36,8 +36,10 @@ jobs:
           run: git config --global url."https://github.com/".insteadOf ssh://git@github.com/
         - name: Build Windows application
           working-directory: agentnet-annotator
+          # bash stops at the first failing command, pwsh would carry on
+          shell: bash
           run: |
-              npm ci
+              npm install
               npm run build-flask
               npm run package -- --platform=win32 --arch=x64
         - name: Zip application
