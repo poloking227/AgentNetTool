@@ -1,0 +1,50 @@
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build-windows
+      - crash-recovery
+
+jobs:
+  build-windows-executables:
+    name: Build Windows app
+    runs-on: windows-latest
+    steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+        - name: Set up Python
+          uses: actions/setup-python@v4
+          with:
+              python-version: '3.12'
+        - name: Install python dependencies
+          run: pip install -r requirements_windows.txt
+        - name: Download ffmpeg
+          shell: pwsh
+          run: |
+              Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile ffmpeg.zip
+              Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-download
+              $ffmpeg = Get-ChildItem ffmpeg-download -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+              Copy-Item $ffmpeg.FullName agentnet-annotator/api/ffmpeg.exe
+        - name: Setup Node
+          uses: actions/setup-node@v4
+          with:
+            node-version: '20.15.0'
+        - name: Fetch GitHub git dependencies over HTTPS
+          # package-lock.json pins @electron/node-gyp to an ssh:// URL, the runner has no SSH key
+          run: git config --global url."https://github.com/".insteadOf ssh://git@github.com/
+        - name: Build Windows application
+          working-directory: agentnet-annotator
+          run: |
+              npm ci
+              npm run build-flask
+              npx electron-forge package --platform=win32 --arch=x64
+        - name: Zip application
+          # Python's zipfile writes "/" separators, which AgentNet-Setup checks for
+          run: python -c "import shutil; shutil.make_archive('agentnet-annotator-win32-x64', 'zip', 'agentnet-annotator/out', 'agentnet-annotator-win32-x64')"
+        - name: Upload zip
+          uses: actions/upload-artifact@v4
+          with:
+            name: agentnet-annotator-win32-x64
+            path: agentnet-annotator-win32-x64.zip
