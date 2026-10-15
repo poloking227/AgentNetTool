@@ -39,7 +39,7 @@ jobs:
           run: |
               npm ci
               npm run build-flask
-              npx electron-forge package --platform=win32 --arch=x64
+              npm run package -- --platform=win32 --arch=x64
         - name: Zip application
           # Python's zipfile writes "/" separators, which AgentNet-Setup checks for
           run: python -c "import shutil; shutil.make_archive('agentnet-annotator-win32-x64', 'zip', 'agentnet-annotator/out', 'agentnet-annotator-win32-x64')"
