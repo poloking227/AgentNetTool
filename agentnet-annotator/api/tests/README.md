@@ -27,21 +27,24 @@ frame count too, so retry validation takes additional time.
 
 Model failure checks also require the project `requests` dependency (use the
 project virtual environment). They mock all HTTP calls: timeout, connection,
-HTTP status, non-JSON/invalid result shapes, cache validation, failed match-stage
-propagation, manual Retry, and disabled-model behavior. No remote requests occur.
+HTTP status, non-JSON/invalid result shapes, cache validation, optional model
+fallback, manual Retry, and disabled-model behavior. No remote requests occur.
 
-When enabled model recognition fails, the persisted task is `failed` at stage
-`match`, with `error_kind: model`. The sidebar shows “Model recognition failed”,
-a safe error description, and Retry. Retry resets the error/attempt count while
-keeping the processing configuration, clip fingerprint and valid model cache.
-HTTP requests have 10-second connect / 60-second read timeouts. Non-JSON,
-service-error, missing/mismatched results and invalid result entries fail before
-any new cache entries are saved. Old invalid cache entries are removed. Model
-recognition disabled by the user does not prevent local completion.
+Remote model recognition is optional enrichment. If it fails, the reducer logs
+the exception internally, keeps the available local targets and continues dump
+and clipping. The task can reach `done` without a model result; no model-failure
+toast or Retry is needed. This does not mean model annotation succeeded. Real
+video/processing failures still produce visible failed state and Retry.
 
-The macOS 1.0.1-test.2 test build includes this behavior; 1.0.1-test.1 does not.
-Installed macOS checks covered visible model failure and Retry, but the remote
-service returned HTTP 522, so a successful remote recognition still needs testing.
+HTTP requests retain 10-second connect / 60-second read timeouts. Response
+validation and cache checks remain strict: invalid results are never saved as
+successful predictions, and old invalid entries are removed. The endpoint and
+successful-result path remain available for a future replacement service.
+
+These optional-model changes require a new build; the installed macOS
+1.0.1-test.2 build still treats model errors as processing failures. Tests exercise
+both Darwin and Windows branches with mocked model failures, confirm the pipeline
+finishes and emits success, and confirm a subsequent encoder error still fails.
 Windows packaged application checks remain pending.
 
 State corruption checks distinguish absent files (legacy fallback) from existing
