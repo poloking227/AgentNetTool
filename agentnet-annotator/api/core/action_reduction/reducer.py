@@ -47,6 +47,8 @@ if __name__ == "__main__":
     sys.path.append(parent_dir)
     from api.core.action_reduction.action import *
     from api.core.action_reduction.reduction_helper import *
+    from api.core.model_prediction import ModelPredictionError, is_valid_prediction, validate_predictions
+    from api.core.video_validation import read_video_timing, validate_video
     from api.core.logger import logger
     from api.core.a11y import parse_element
     from api.core.utils import (
@@ -61,6 +63,8 @@ if __name__ == "__main__":
 else:
     from .action import *
     from .reduction_helper import *
+    from ..model_prediction import ModelPredictionError, is_valid_prediction, validate_predictions
+    from ..video_validation import read_video_timing, validate_video
     from ..logger import logger
     from ..ai_assistant import predict_targets
     from ..a11y import parse_element
@@ -717,9 +721,25 @@ class Reducer:
     def process_actions_multithreaded(self, recording_path, video_attrs, window_attrs):
         clips_dir = os.path.join(recording_path, "video_clips")
 
+        source_timing = None
+
         def clip_done(action):
+            nonlocal source_timing
             clip_path = os.path.join(clips_dir, f"{action.id}_{action.action}.mp4")
-            return os.path.exists(clip_path) and os.path.getsize(clip_path) > 0
+            if not os.path.isfile(clip_path):
+                return False
+            try:
+                if source_timing is None:
+                    video_name = action._get_video_name(recording_path)
+                    if video_name is None:
+                        raise FileNotFoundError(f"No source video found in {recording_path}")
+                    source_timing = read_video_timing(os.path.join(recording_path, video_name))
+                expected_frames = action.expected_video_frames(dict(video_attrs, **source_timing))
+                validate_video(clip_path, expected_frames=expected_frames)
+                return True
+            except Exception as e:
+                logger.info(f"Reducer: clip {action.id} needs regeneration: {e}")
+                return False
 
         def process_action(action, recording_path, video_attrs, window_attrs):
             action.to_video(
@@ -753,7 +773,7 @@ class Reducer:
                     process_action(action, recording_path, video_attrs, window_attrs)
                 except Exception as e:
                     logger.exception(f"Reducer: clip {action.id} failed: {e}")
-                    failed.append(action.id)
+                    failed.append((action.id, str(e)))
                 finally:
                     q.task_done()
 
@@ -768,7 +788,8 @@ class Reducer:
             thread.join()
 
         if failed:
-            raise RuntimeError(f"Failed to cut video clips for actions {sorted(failed)}")
+            details = "; ".join(f"action {action_id}: {error}" for action_id, error in sorted(failed))
+            raise RuntimeError(f"Failed to cut video clips: {details}")
 
     def _save_action(self, action):
         action.complete_dump(recording_dir=self.recording_path)
@@ -1027,7 +1048,10 @@ class Reducer:
                     ):
                         self.reduced_actions[index].past_frame_target["mark"] = False
             except Exception as e:
-                logger.exception(f"Reducer: match_element: {str(e)}")
+                logger.exception("Reducer: model recognition failed")
+                if isinstance(e, ModelPredictionError):
+                    raise
+                raise ModelPredictionError("Model recognition failed. Original recording is preserved. Retry processing.") from e
 
         # Save html info
         # Keep time order (a set doesn't): the lookups above assume sorted data
@@ -1051,12 +1075,20 @@ class Reducer:
             except (OSError, ValueError) as e:
                 logger.warning(f"Reducer: ignoring invalid gpt cache: {e}")
 
+        invalid_cache = not isinstance(cache, dict)
+        if invalid_cache:
+            cache = {}
+        valid_cache = {key: value for key, value in cache.items() if is_valid_prediction(value)}
+        if invalid_cache or valid_cache != cache:
+            atomic_write_text(cache_path, json.dumps(valid_cache, ensure_ascii=False))
+        cache = valid_cache
+
         def _key(event):
             return f"{event['id']}:{event['timestamp']}"
 
         missing = [event for event in need_gpt_list if _key(event) not in cache]
         if missing:
-            results = predict_targets(self.recording_path, missing)
+            results = validate_predictions(predict_targets(self.recording_path, missing), len(missing))
             for event, result in zip(missing, results):
                 cache[_key(event)] = result
             atomic_write_text(cache_path, json.dumps(cache, ensure_ascii=False))

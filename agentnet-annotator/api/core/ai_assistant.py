@@ -1,4 +1,5 @@
 import requests
+from .model_prediction import ModelPredictionError, request_predictions
 import os
 import json
 
@@ -77,6 +78,8 @@ def predict_targets(recording_path, events):
         screen_width,
         screen_height,
     )
+    if len(frames) != len(events):
+        raise ModelPredictionError("Model recognition failed: could not extract all required video frames. Original recording is preserved. Retry processing.")
     payload = {
         "interpretations": [
             {
@@ -87,9 +90,4 @@ def predict_targets(recording_path, events):
             for frame, event in zip(frames, events)
         ]
     }
-    response = requests.post(
-        f"{SERVER_URL}/interpret_actions",
-        json=payload,
-    )
-    logger.info(f"Response from interpret_actions: {response.json()}")
-    return response.json().get("results", [])
+    return request_predictions(f"{SERVER_URL}/interpret_actions", payload, len(events))
