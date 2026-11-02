@@ -9,6 +9,7 @@ state file survives and the processing can be resumed on the next start.
 """
 
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -84,22 +85,74 @@ def atomic_write_text(path, text):
     replace_file(tmp_path, path)
 
 
+def _invalid_state(reason):
+    # Keep errors visible without modifying the file during discovery/startup.
+    # A manual Retry can replace a damaged state after checking the raw data.
+    return {
+        "status": STATE_FAILED,
+        "stage": STAGE_QUEUED,
+        "attempts": 0,
+        "error_kind": "state",
+        "error": reason,
+    }
+
+
+def _validate_state(state):
+    if not isinstance(state, dict):
+        raise ValueError("state must be an object")
+    if state.get("status") not in (STATE_PENDING, STATE_PROCESSING, STATE_DONE, STATE_FAILED):
+        raise ValueError("invalid or missing status")
+    if "attempts" in state and (type(state["attempts"]) is not int or state["attempts"] < 0):
+        raise ValueError("invalid attempts")
+    if "stage" in state and state["stage"] not in (STAGE_QUEUED, STAGE_REDUCE, STAGE_MATCH, STAGE_DUMP, STAGE_CLIPS, STAGE_DONE):
+        raise ValueError("invalid stage")
+    for key in ("error", "error_kind"):
+        if state.get(key) is not None and not isinstance(state[key], str):
+            raise ValueError("invalid processing error description")
+    configs = state.get("configs")
+    if configs is not None:
+        if not isinstance(configs, dict):
+            raise ValueError("invalid processing configuration")
+        for key in ("generate_window_a11y", "generate_element_a11y"):
+            if key in configs and type(configs[key]) is not bool:
+                raise ValueError("invalid processing configuration flag")
+    window = state.get("window_attrs")
+    if window is not None:
+        if not isinstance(window, dict):
+            raise ValueError("invalid window dimensions")
+        for key in ("width", "height"):
+            value = window.get(key)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError("invalid window dimensions")
+    return state
+
+
 def read_state(recording_path):
+    """Return None only for an absent state; damaged/unreadable states are failed."""
     path = os.path.join(recording_path, STATE_FILE)
-    if not os.path.exists(path):
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
         return None
+    except OSError as error:
+        logger.warning(f"read_state: cannot inspect {path}: {error}")
+        return _invalid_state("Cannot inspect processing_state.json. Check file permissions, then Retry processing in AgentNet.")
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError) as e:
-        logger.warning(f"read_state: invalid state file {path}: {e}")
-        return None
+            return _validate_state(json.load(f))
+    except OSError as error:
+        logger.warning(f"read_state: cannot read {path}: {error}")
+        return _invalid_state("Cannot read processing_state.json. Check file permissions, then Retry processing in AgentNet.")
+    except (ValueError, TypeError, OverflowError) as error:
+        logger.warning(f"read_state: invalid state file {path}: {error}")
+        return _invalid_state("Invalid processing_state.json. Original recording is preserved. Retry processing in AgentNet.")
 
 
 def write_state(recording_path, **updates):
     """Merge updates into the state file and persist it atomically."""
     state = read_state(recording_path) or {}
     state.update(updates)
+    state.setdefault("status", STATE_PENDING)
     state["updated_at"] = datetime.now().isoformat(timespec="seconds")
     atomic_write_text(
         os.path.join(recording_path, STATE_FILE),

@@ -121,6 +121,7 @@ class RecordingService:
                 stage=STAGE_QUEUED,
                 attempts=0,
                 error=None,
+                error_kind=None,
                 window_attrs=self.recording_window_attrs,
                 configs={
                     "generate_window_a11y": recorder.gen_window,
@@ -147,20 +148,35 @@ class RecordingService:
             return FAILED, "Recording not found"
         if self._is_active_recording(recording_id):
             return FAILED, "Recording is still in progress"
-        with self._active_lock:
-            if recording_id in self._active_recordings:
-                return FAILED, "Recording is already being processed"
         if not has_raw_data(recording_path):
             return FAILED, "Raw recording data is missing, it can't be processed"
 
-        write_state(
-            recording_path,
-            status=STATE_PENDING,
-            stage=STAGE_QUEUED,
-            attempts=0,
-            error=None,
-        )
-        self._enqueue(recording_id)
+        # Reserve, persist and enqueue under the same lock. A concurrent Retry
+        # must not reset a worker's final state without actually queueing work.
+        with self._active_lock:
+            if recording_id in self._active_recordings:
+                return FAILED, "Recording is already being processed"
+            self._active_recordings.add(recording_id)
+            try:
+                write_state(
+                    recording_path,
+                    status=STATE_PENDING,
+                    stage=STAGE_QUEUED,
+                    attempts=0,
+                    error=None,
+                    error_kind=None,
+                )
+                self.reducer_queue.put(recording_id)
+            except Exception:
+                self._active_recordings.discard(recording_id)
+                logger.exception("RecordingService: could not queue Retry")
+                try:
+                    write_state(recording_path, status=STATE_FAILED,
+                                error="Could not queue processing. Check file permissions and free disk space, then Retry.",
+                                error_kind="queue")
+                except OSError:
+                    logger.exception("RecordingService: could not persist Retry failure")
+                return FAILED, "Could not queue processing. Check file permissions and free disk space, then Retry."
         return SUCCEED, "Recording processing restarted"
 
     def get_user_recordings(self) -> Dict:
@@ -292,7 +308,11 @@ class RecordingService:
             if recording_id in self._active_recordings:
                 return
             self._active_recordings.add(recording_id)
-        self.reducer_queue.put(recording_id)
+            try:
+                self.reducer_queue.put(recording_id)
+            except Exception:
+                self._active_recordings.discard(recording_id)
+                raise
 
     def _is_active_recording(self, recording_id: str) -> bool:
         recorder = self.recorder_thread
@@ -313,29 +333,32 @@ class RecordingService:
             key=os.path.getctime,
         )
         for recording_path in recording_paths:
-            state = read_state(recording_path)
-            if state is None:
-                # Recorded before state files existed: let the user decide
-                continue
-            if state.get("status") not in (STATE_PENDING, STATE_PROCESSING):
-                continue
-            recording_id = os.path.basename(recording_path)
-            if state.get("attempts", 0) >= MAX_AUTO_RESUME_ATTEMPTS:
-                logger.warning(
-                    f"RecordingService: not resuming {recording_id} automatically, "
-                    f"interrupted {state.get('attempts')} times"
+            try:
+                state = read_state(recording_path)
+                if state is None:
+                    # Recorded before state files existed: let the user decide
+                    continue
+                if state.get("status") not in (STATE_PENDING, STATE_PROCESSING):
+                    continue
+                recording_id = os.path.basename(recording_path)
+                if state.get("attempts", 0) >= MAX_AUTO_RESUME_ATTEMPTS:
+                    logger.warning(
+                        f"RecordingService: not resuming {recording_id} automatically, "
+                        f"interrupted {state.get('attempts')} times"
+                    )
+                    continue
+                if not has_raw_data(recording_path):
+                    logger.warning(
+                        f"RecordingService: can't resume {recording_id}, raw data missing"
+                    )
+                    continue
+                logger.info(
+                    f"RecordingService: resuming interrupted processing of {recording_id} "
+                    f"(stage: {state.get('stage')})"
                 )
-                continue
-            if not has_raw_data(recording_path):
-                logger.warning(
-                    f"RecordingService: can't resume {recording_id}, raw data missing"
-                )
-                continue
-            logger.info(
-                f"RecordingService: resuming interrupted processing of {recording_id} "
-                f"(stage: {state.get('stage')})"
-            )
-            self._enqueue(recording_id)
+                self._enqueue(recording_id)
+            except (OSError, ValueError, TypeError) as error:
+                logger.warning(f"RecordingService: skipping unreadable recording {recording_path}: {error}")
 
     def _build_reducer(self, recording_path: str, state: Dict) -> Reducer:
         window_attrs = state.get("window_attrs")
@@ -373,6 +396,7 @@ class RecordingService:
             status=STATE_PROCESSING,
             attempts=previous_state.get("attempts", 0) + 1,
             error=None,
+            error_kind=None,
         )
         try:
             reducer = self._build_reducer(recording_path, state)
@@ -389,13 +413,13 @@ class RecordingService:
         except Exception as e:
             logger.exception(f"RecordingService: Error in reduce_pipeline: {e}")
             if os.path.isdir(recording_path):
-                write_state(recording_path, status=STATE_FAILED, error=str(e))
+                write_state(recording_path, status=STATE_FAILED, error=str(e), error_kind=getattr(e, "error_kind", None))
             self.socketio.emit(
                 "reduced",
                 {
                     "status": "failed",
                     "recording_id": recording_id,
-                    "message": "Recording processing failed",
+                    "message": f"Recording processing failed: {e}",
                 },
             )
 
@@ -423,13 +447,13 @@ class RecordingService:
             return "recording"
         recording_path = os.path.join(RECORDING_DIR, recording_id)
         status = get_processing_status(recording_path)
+        if status == STATE_FAILED:
+            return "failed"
         if status != STATE_DONE and not has_raw_data(recording_path):
             # Nothing to resume from: shown as BROKEN (not visualizable)
             return "local"
         if status in (STATE_PENDING, STATE_PROCESSING):
             return "interrupted"
-        if status == STATE_FAILED:
-            return "failed"
         # Done, or not processable at all (then it isn't visualizable: BROKEN)
         return "local"
 
@@ -506,6 +530,9 @@ class RecordingService:
         recording["status"] = (
             "local" if reviewing else self._get_processing_status(recording_name)
         )
+        state = read_state(self._get_recording_path(recording_name, reviewing)) or {}
+        recording["processing_error"] = state.get("error") if recording["status"] == "failed" else None
+        recording["processing_error_kind"] = state.get("error_kind") if recording["status"] == "failed" else None
         recording["task_name"] = get_task_name_from_folder(recording_name, reviewing)
         recording["task_description"] = get_description_from_folder(
             recording_name, reviewing

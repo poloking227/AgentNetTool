@@ -72,6 +72,8 @@ interface localRecordingProp {
     creation_time: string;
     task_name: string;
     recording_status: Record<string, any>;
+    processing_error?: string | null;
+    processing_error_kind?: string | null;
     visualizable: boolean;
     status: string;
 }
@@ -111,6 +113,8 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
         userData,
     } = useMain();
     const navigate = useNavigate();
+    const retryRequests = React.useRef(new Set<string>());
+    const [retryingRecordings, setRetryingRecordings] = useState<Set<string>>(new Set());
     const params = useParams();
     const [open, setOpen] = useState(init_open);
     const [notUploadedTasksList, setNotUploadedTasksList] = useState(
@@ -237,6 +241,9 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
     };
 
     const handleReprocessRecording = async (recordingName: string) => {
+        if (retryRequests.current.has(recordingName)) return;
+        retryRequests.current.add(recordingName);
+        setRetryingRecordings(new Set(retryRequests.current));
         try {
             const response = await fetch(
                 `http://localhost:5328/api/recording/${recordingName}/reprocess`,
@@ -251,7 +258,12 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
         } catch (error) {
             showError("Network error or server is down.");
         } finally {
-            fetchTasks();
+            try {
+                await fetchTasks();
+            } finally {
+                retryRequests.current.delete(recordingName);
+                setRetryingRecordings(new Set(retryRequests.current));
+            }
         }
     };
 
@@ -579,23 +591,32 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
                                                                 {recording.status ===
                                                                 "interrupted"
                                                                     ? "Processing interrupted"
-                                                                    : "Processing failed"}
+                                                                    : recording.processing_error_kind === "model"
+                                                                      ? "Model recognition failed"
+                                                                      : "Processing failed"}
                                                                 {" · "}
                                                                 <span
                                                                     role="button"
-                                                                    className="underline cursor-pointer"
+                                                                    aria-disabled={retryingRecordings.has(recording.name)}
+                                                                    className={retryingRecordings.has(recording.name) ? "opacity-50 cursor-wait" : "underline cursor-pointer"}
                                                                     onClick={() =>
                                                                         handleReprocessRecording(
                                                                             recording.name
                                                                         )
                                                                     }
                                                                 >
-                                                                    {recording.status ===
-                                                                    "interrupted"
-                                                                        ? "Resume"
-                                                                        : "Retry"}
+                                                                    {retryingRecordings.has(recording.name)
+                                                                        ? "Queueing..."
+                                                                        : recording.status === "interrupted"
+                                                                          ? "Resume"
+                                                                          : "Retry"}
                                                                 </span>
                                                             </p>
+                                                            {recording.processing_error && (
+                                                                <p className="text-[10px] text-red-600 dark:text-red-400 break-words whitespace-normal select-text">
+                                                                    {recording.processing_error}
+                                                                </p>
+                                                            )}
                                                         </div>
                                                     ) : recording.visualizable ? (
                                                         <Link
