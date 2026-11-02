@@ -47,7 +47,7 @@ if __name__ == "__main__":
     sys.path.append(parent_dir)
     from api.core.action_reduction.action import *
     from api.core.action_reduction.reduction_helper import *
-    from api.core.model_prediction import ModelPredictionError, is_valid_prediction, validate_predictions
+    from api.core.model_prediction import is_valid_prediction, validate_predictions
     from api.core.video_validation import read_video_timing, validate_video
     from api.core.logger import logger
     from api.core.a11y import parse_element
@@ -63,7 +63,7 @@ if __name__ == "__main__":
 else:
     from .action import *
     from .reduction_helper import *
-    from ..model_prediction import ModelPredictionError, is_valid_prediction, validate_predictions
+    from ..model_prediction import is_valid_prediction, validate_predictions
     from ..video_validation import read_video_timing, validate_video
     from ..logger import logger
     from ..ai_assistant import predict_targets
@@ -1047,11 +1047,10 @@ class Reducer:
                         self.reduced_actions[index].past_frame_target, dict
                     ):
                         self.reduced_actions[index].past_frame_target["mark"] = False
-            except Exception as e:
-                logger.exception("Reducer: model recognition failed")
-                if isinstance(e, ModelPredictionError):
-                    raise
-                raise ModelPredictionError("Model recognition failed. Original recording is preserved. Retry processing.") from e
+            except Exception:
+                # Recognition is optional enrichment. Preserve local targets;
+                # invalid responses remain excluded from the model cache.
+                logger.exception("Reducer: optional model recognition unavailable; continuing with local targets")
 
         # Save html info
         # Keep time order (a set doesn't): the lookups above assume sorted data

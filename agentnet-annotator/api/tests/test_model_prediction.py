@@ -88,21 +88,47 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(predict.call_args.args[1],self.events)
         self.assertEqual(json.loads(self.cache.read_text()),{'0:1':results[0],'1:2':results[1]})
 
-    def test_match_failure_is_not_swallowed(self):
-        self.reducer.reduced_actions=[types.SimpleNamespace(action='click',axtree=None,target=None,start_time=1,description='test',coordinate={'x':1,'y':1})]
-        with patch.object(self.reducer,'_predict_targets_cached',side_effect=model.ModelPredictionError('Model service unavailable')):
-            with self.assertRaisesRegex(model.ModelPredictionError,'unavailable'):self.reducer.match_element()
+    def test_match_failure_keeps_local_targets(self):
+        (self.path/'element.jsonl').write_text('fixture')
+        for error in [model.ModelPredictionError('HTTP 522'), ValueError('Bad frames')]:
+            action=types.SimpleNamespace(action='click',axtree={},target={'role_description':'image','mark':False},start_time=1,description='test',coordinate={'x':1,'y':1},past_frame_target={'title':'previous','mark':True})
+            self.reducer.reduced_actions=[action]
+            with self.subTest(error=type(error)), patch.object(reducer_module,'read_encrypted_jsonl',return_value=[{'time_stamp':1,'a11y_tree':{}}]), patch.object(reducer_module,'parse_element',side_effect=[action.past_frame_target, action.target]), patch.object(self.reducer,'_predict_targets_cached',side_effect=error) as predict:
+                self.reducer.match_element()
+            predict.assert_called_once()
+            self.assertEqual(action.target, {'role_description':'image','mark':False})
+            self.assertTrue(action.past_frame_target['mark'])
+            self.assertFalse(hasattr(action,'gpt_target'))
 
-    def test_pipeline_failure_stays_failed_at_match(self):
-        r=self.reducer;r.event_buffer=[];r.flatten=False;r.generate_window_a11y=False;r.generate_element_a11y=True;r.reduced_actions=[]
-        for name in ['compress','reduce_all','transform','finish']:setattr(r,name,MagicMock())
-        r.match_element=MagicMock(side_effect=model.ModelPredictionError('Model timed out; original recording preserved. Retry.'))
-        service=object.__new__(service_module.RecordingService);service.socketio=MagicMock();service._build_reducer=lambda *args:r
-        raw=self.path/'events.jsonl';raw.write_text('raw input preserved')
-        with patch.object(service_module,'RECORDING_DIR',str(self.path.parent)):service._process_recording(self.path.name)
-        saved=state.read_state(self.path)
-        self.assertEqual(saved['status'],'failed');self.assertEqual(saved['stage'],'match');self.assertEqual(saved['error_kind'],'model');self.assertIn('Model timed out',saved['error'])
-        self.assertEqual(raw.read_text(),'raw input preserved');self.assertEqual(service.socketio.emit.call_args.args[1]['status'],'failed')
+    def test_pipeline_model_failure_is_optional_but_encoder_failure_is_not(self):
+        for platform in ['Darwin', 'Windows']:
+            for clipping_error in [None, RuntimeError('Encoder unavailable')]:
+                with self.subTest(platform=platform, clipping_error=clipping_error):
+                    r=self.reducer;r.event_buffer=[];r.flatten=False;r.generate_window_a11y=False;r.generate_element_a11y=True
+                    r.reduced_actions=[types.SimpleNamespace(action='click',axtree=None,target=None,start_time=1,description='test',coordinate={'x':1,'y':1},set_id=MagicMock())]
+                    for name in ['compress','reduce_all','transform','finish','complete_dump','vis_dump']:
+                        setattr(r,name,MagicMock())
+                    r._prepare_clips_dir=MagicMock(return_value='test-fingerprint')
+                    r.process_actions_multithreaded=MagicMock(side_effect=clipping_error)
+                    service=object.__new__(service_module.RecordingService);service.socketio=MagicMock();service._build_reducer=lambda *args:r
+                    raw=self.path/'events.jsonl';raw.write_text('raw input preserved')
+                    (self.path/'metadata.json').write_text(json.dumps({'video_start_timestamp':0}))
+                    (self.path/'raw.mp4').write_bytes(b'test fixture')
+                    with patch.object(service_module,'RECORDING_DIR',str(self.path.parent)), patch('platform.system',return_value=platform), patch.object(reducer_module.time,'sleep'), patch.object(r,'_predict_targets_cached',side_effect=model.ModelPredictionError('HTTP 522')) as predict:
+                        service._process_recording(self.path.name)
+                    predict.assert_called_once()
+                    saved=state.read_state(self.path)
+                    self.assertEqual(raw.read_text(),'raw input preserved')
+                    r.complete_dump.assert_called_once()
+                    r.process_actions_multithreaded.assert_called_once()
+                    if clipping_error is None:
+                        self.assertEqual(saved['status'],'done');self.assertEqual(saved['stage'],'done')
+                        self.assertIsNone(saved['error']);self.assertIsNone(saved['error_kind'])
+                        self.assertEqual(service.socketio.emit.call_args.args[1]['status'],'succeed')
+                    else:
+                        self.assertEqual(saved['status'],'failed')
+                        self.assertIn('Encoder unavailable',saved['error'])
+                        self.assertEqual(service.socketio.emit.call_args.args[1]['status'],'failed')
 
     def test_manual_retry_keeps_config_and_clip_fingerprint(self):
         import threading
