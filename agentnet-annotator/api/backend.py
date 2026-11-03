@@ -88,6 +88,7 @@ class AgentNetBackend:
             # Recording Operations
             ("/api/recording/<recording_name>/confirm", self.recording_controller.confirm_recording, {"methods": ["POST"]}),
             ("/api/recording/<recording_name>/hub_data", self.recording_controller.get_hub_data),
+            ("/api/recording/<recording_name>/reprocess", self.recording_controller.reprocess_recording, {"methods": ["POST"]}),
             ("/api/recording/<recording_name>/cut", self.recording_controller.annotate_task_endpoint, {"methods": ["POST"]}),
             # Local Operations
             ("/api/recording/<recording_name>/delete_local_recording", self.recording_controller.delete_local_recording_endpoint),

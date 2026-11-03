@@ -35,6 +35,8 @@ interface localRecordingProp {
     creation_time: string;
     task_name: string;
     recording_status: Record<string, any>;
+    processing_error?: string | null;
+    processing_error_kind?: string | null;
     visualizable: boolean;
     status: string;
 }
@@ -224,6 +226,9 @@ export const MainProvider: React.FC<{ children: ReactNode }> = ({
     useEffect(() => {
         SocketService.Listen("reduced", (response) => {
             console.log("reduced");
+            if (response?.status === "failed") {
+                showError(response.message || "Recording processing failed, retry it from the sidebar");
+            }
             setTimeout(() => {
                 fetchTasks();
             }, 1500);

@@ -1,4 +1,5 @@
 import os
+import math
 import cv2
 import numpy as np
 from collections import OrderedDict
@@ -17,12 +18,16 @@ if __name__ == "__main__":
         wrap_func_key,
     )
     from api.core.logger import logger
+    from api.core.video_validation import validate_video
+    from api.core.processing_state import fsync_path, replace_file
 else:
     from .reduction_helper import (
         MODIFIED_KEYS, MOUSE_LONG_PRESS_INTERVAL,
         wrap_func_key,
     )
     from ..logger import logger
+    from ..video_validation import validate_video
+    from ..processing_state import fsync_path, replace_file
 
 
 class ActionBuilder:
@@ -238,71 +243,90 @@ class Action:
             end_time = end_time + 0.1
         return start_time, end_time
 
-    def to_video(self, recording_path, video_attrs, window_attrs):
-        video_start_time = video_attrs["video_start_time"]
+    def _video_clip_times(self, video_start_time):
         start_time = self._get_video_start_time() - video_start_time
         end_time = self._get_video_end_time() - video_start_time
-        start_time, end_time = self.process_start_end_time(
-            start_time, end_time)
+        start_time, end_time = self.process_start_end_time(start_time, end_time)
+        if not all(math.isfinite(t) for t in (start_time, end_time)) or end_time <= start_time:
+            raise ValueError(f"Invalid time range for action {self.id}: {start_time} to {end_time}")
+        return start_time, end_time
 
+    def expected_video_frames(self, video_attrs):
+        """Use the same buffered, source-clamped range for new and reused clips."""
+        start_time, end_time = self._video_clip_times(video_attrs["video_start_time"])
+        fps, total_frames = video_attrs["fps"], video_attrs["total_frames"]
+        if not all(math.isfinite(v) and v > 0 for v in (fps, total_frames)):
+            raise ValueError("Invalid source video timing")
+        expected_frames = min(int(total_frames), int(end_time * fps)) - max(0, int(start_time * fps))
+        if expected_frames <= 0:
+            raise ValueError(f"Action {self.id} is outside the source video")
+        return expected_frames
+
+    def to_video(self, recording_path, video_attrs, window_attrs):
+        start_time, end_time = self._video_clip_times(video_attrs["video_start_time"])
         video_clip_name = f"{self.id}_{self.action}"
 
-        if end_time <= start_time:
-            logger.warning(
-                f"action.py to_video error: Invalid time range for action {self.id}. Skipping."
-            )
-            return
-
         video_name = self._get_video_name(recording_path)
+        if video_name is None:
+            raise FileNotFoundError(f"No source video found in {recording_path}")
         video_path = os.path.join(recording_path, video_name)
 
-        max_attempts = 10
-        attempt = 0
         cap = None
-        while attempt < max_attempts:
-            try:
+        out = None
+        part_path = None
+        try:
+            for attempt in range(10):
                 cap = cv2.VideoCapture(video_path)
-                if cap.isOpened() and cap is not None:
+                if cap.isOpened():
                     break
-                attempt += 1
-                logger.warning(
-                    f"Attempt {attempt} to open video file failed. Retrying in 1 second..."
+                cap.release()
+                cap = None
+                if attempt < 9:
+                    time.sleep(1)
+            if cap is None:
+                raise IOError(f"Cannot open video {video_path}")
+
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            if not all(math.isfinite(v) and v > 0 for v in (fps, width, height, total_frames)):
+                raise ValueError(f"Invalid source video metadata: {video_path}")
+            width, height, total_frames = int(width), int(height), int(total_frames)
+            expected_frames = self.expected_video_frames(
+                dict(video_attrs, fps=fps, total_frames=total_frames)
+            )
+
+            clips_dir = os.path.join(recording_path, "video_clips")
+            os.makedirs(clips_dir, exist_ok=True)
+            output_path = os.path.join(clips_dir, f"{video_clip_name}.mp4")
+            part_path = os.path.join(clips_dir, f"{video_clip_name}.part.mp4")
+            out = cv2.VideoWriter(part_path, cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height))
+            if not out.isOpened():
+                raise RuntimeError(
+                    f"Cannot open H.264 (avc1) video encoder for action {self.id}. "
+                    "Check codec availability, output permissions and free disk space."
                 )
-                time.sleep(1)
-            except Exception as e:
-                logger.exception(
-                    f"Error during attempt {attempt} to open video: {str(e)}")
-                attempt += 1
-                time.sleep(1)
+            # Each clipping thread owns its metadata; do not mutate shared input.
+            clip_attrs = dict(video_attrs, fps=fps, width=width, height=height, total_frames=total_frames)
+            self.process_video_segment(
+                start_time, end_time, cap, out,
+                video_attrs=clip_attrs, window_attrs=window_attrs,
+            )
+            cap.release()
+            out.release()
+            cap = out = None
 
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")
-
-        os.makedirs(os.path.join(recording_path, "video_clips"), exist_ok=True)
-        output_path = os.path.join(
-            recording_path, "video_clips", f"{video_clip_name}.mp4"
-        )
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        video_attrs.update(
-            {
-                "fps": fps,
-                "width": width,
-                "height": height,
-                "total_frames": total_frames,
-            }
-        )
-
-        self.process_video_segment(
-            start_time,
-            end_time,
-            cap,
-            out,
-            video_attrs=video_attrs,
-            window_attrs=window_attrs,
-        )
+            validate_video(part_path, expected_frames=expected_frames)
+            fsync_path(part_path)
+            replace_file(part_path, output_path)
+        finally:
+            if cap is not None:
+                cap.release()
+            if out is not None:
+                out.release()
+            if part_path is not None and os.path.exists(part_path):
+                os.remove(part_path)
 
     def process_video_segment(
         self, start_time, end_time, cap, out, video_attrs: dict, window_attrs: dict

@@ -181,6 +181,11 @@ node_modules/
 package-lock.json
 
 tests
+# Keep the offline reprocessing regression suite in version control.
+!agentnet-annotator/api/tests/
+agentnet-annotator/api/tests/*
+!agentnet-annotator/api/tests/*.py
+!agentnet-annotator/api/tests/README.md
 
 # ffmpeg
 ffmpeg

@@ -72,6 +72,8 @@ interface localRecordingProp {
     creation_time: string;
     task_name: string;
     recording_status: Record<string, any>;
+    processing_error?: string | null;
+    processing_error_kind?: string | null;
     visualizable: boolean;
     status: string;
 }
@@ -111,6 +113,8 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
         userData,
     } = useMain();
     const navigate = useNavigate();
+    const retryRequests = React.useRef(new Set<string>());
+    const [retryingRecordings, setRetryingRecordings] = useState<Set<string>>(new Set());
     const params = useParams();
     const [open, setOpen] = useState(init_open);
     const [notUploadedTasksList, setNotUploadedTasksList] = useState(
@@ -232,6 +236,33 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
             fetchTasks();
             if (params.recording_name === recordingName) {
                 navigate("/");
+            }
+        }
+    };
+
+    const handleReprocessRecording = async (recordingName: string) => {
+        if (retryRequests.current.has(recordingName)) return;
+        retryRequests.current.add(recordingName);
+        setRetryingRecordings(new Set(retryRequests.current));
+        try {
+            const response = await fetch(
+                `http://localhost:5328/api/recording/${recordingName}/reprocess`,
+                { method: "POST" }
+            );
+            const result = await response.json();
+            if (response.ok) {
+                showInfo("Processing restarted, finished parts are reused");
+            } else {
+                showError(result.message);
+            }
+        } catch (error) {
+            showError("Network error or server is down.");
+        } finally {
+            try {
+                await fetchTasks();
+            } finally {
+                retryRequests.current.delete(recordingName);
+                setRetryingRecordings(new Set(retryRequests.current));
             }
         }
     };
@@ -511,7 +542,9 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
                                             >
                                                 <ListItemButton className="flex flex-row justify-between w-full">
                                                     {recording.status ===
-                                                    "processing" ? (
+                                                        "processing" ||
+                                                    recording.status ===
+                                                        "recording" ? (
                                                         <div
                                                             style={{
                                                                 maxWidth: "80%",
@@ -533,8 +566,57 @@ export default function Sidebar({ tasks, init_open }: SidebarProps) {
                                                                 }
                                                             </p>
                                                             <p className="text-[10px] text-gray-400">
-                                                                Processing...
+                                                                {recording.status ===
+                                                                "recording"
+                                                                    ? "Recording..."
+                                                                    : "Processing..."}
                                                             </p>
+                                                        </div>
+                                                    ) : recording.status ===
+                                                          "interrupted" ||
+                                                      recording.status ===
+                                                          "failed" ? (
+                                                        <div
+                                                            style={{
+                                                                maxWidth: "80%",
+                                                            }}
+                                                            className="flex flex-col gap-0"
+                                                        >
+                                                            <p className="text-sm font-semibold text-zinc-600 truncate dark:text-zinc-400">
+                                                                {
+                                                                    recording.task_name
+                                                                }
+                                                            </p>
+                                                            <p className="text-[10px] text-amber-600 truncate dark:text-amber-400">
+                                                                {recording.status ===
+                                                                "interrupted"
+                                                                    ? "Processing interrupted"
+                                                                    : recording.processing_error_kind === "model"
+                                                                      ? "Model recognition failed"
+                                                                      : "Processing failed"}
+                                                                {" · "}
+                                                                <span
+                                                                    role="button"
+                                                                    aria-disabled={retryingRecordings.has(recording.name)}
+                                                                    className={retryingRecordings.has(recording.name) ? "opacity-50 cursor-wait" : "underline cursor-pointer"}
+                                                                    onClick={() =>
+                                                                        handleReprocessRecording(
+                                                                            recording.name
+                                                                        )
+                                                                    }
+                                                                >
+                                                                    {retryingRecordings.has(recording.name)
+                                                                        ? "Queueing..."
+                                                                        : recording.status === "interrupted"
+                                                                          ? "Resume"
+                                                                          : "Retry"}
+                                                                </span>
+                                                            </p>
+                                                            {recording.processing_error && (
+                                                                <p className="text-[10px] text-red-600 dark:text-red-400 break-words whitespace-normal select-text">
+                                                                    {recording.processing_error}
+                                                                </p>
+                                                            )}
                                                         </div>
                                                     ) : recording.visualizable ? (
                                                         <Link

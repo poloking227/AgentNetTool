@@ -20,6 +20,7 @@ from PIL import Image
 
 from .logger import logger
 from .constants import VK_CODE, INCLUDE_LIST, COMPLETE_DATA_LIST
+from .processing_state import STATE_DONE, fsync_fp, get_processing_status, replace_file
 from cryptography.fernet import Fernet
 
 fernet = Fernet(b"afdCZlmzMe6PiDCs1nPSaJIUMsTvesgrpLCCt1u5ML8=")
@@ -50,9 +51,13 @@ def init_encrpted_jsonl(path):
 
 
 def write_encrypted_jsonl(path, data: List):
-    with open(path, "w", encoding="utf-8") as f:
+    # Write to a temp file and swap it in, so a crash never leaves a half-written file
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         for data_row in data:
             write_encrypt_line(fp=f, data=data_row)
+        fsync_fp(f)
+    replace_file(tmp_path, path)
 
 
 def write_jsonl(path, data: List):
@@ -73,12 +78,15 @@ def read_encrypted_jsonl(path):
 
 
 def write_encrypted_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         # f.write("encrypted\n")
         json_data = json.dumps(data, ensure_ascii=False)
         encrypted_data = encrypt_data(json_data)
         # f.write(encrypted_data.decode("utf-8"))
         f.write(encrypted_data)
+        fsync_fp(f)
+    replace_file(tmp_path, path)
 
 
 def check_recording_completeness(directory):
@@ -258,6 +266,8 @@ def get_apps(recording_name: str) -> List[str]:
 
 def get_video_by_id(video_path, id):
     for file_name in os.listdir(video_path):
+        if file_name.endswith(".part.mp4"):
+            continue
         video_id = file_name.split("_")[0]
         if video_id == str(id):
             return file_name
@@ -307,6 +317,10 @@ def check_recording_broken(recording_name: str, reviewing: bool = True) -> bool:
         logger.warning(f"check_recording_broken: {recording_path} doesn't exist.")
         return True
 
+    # Output files exist before processing has finished, so trust the state file
+    if get_processing_status(recording_path) != STATE_DONE:
+        return True
+
     vis_path = os.path.join(recording_path, "reduced_events_vis.jsonl")
     if not os.path.exists(vis_path):
         return True
@@ -327,6 +341,9 @@ def check_recording_visualizable(recording_name, reviewing=True):
 
     if not os.path.exists(recording_path):
         logger.warning(f"check_recording_visualizable: {recording_path} doesn't exist.")
+        return False
+
+    if get_processing_status(recording_path) != STATE_DONE:
         return False
 
     for file_name in INCLUDE_LIST:

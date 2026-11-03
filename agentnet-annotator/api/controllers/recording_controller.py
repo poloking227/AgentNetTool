@@ -70,6 +70,14 @@ class RecordingController:
         return ErrorHandler.handle_service_response((status, message))
 
     @handle_api_errors
+    def reprocess_recording(self, recording_name: str) -> Tuple[Dict[str, Any], int]:
+        """Resume or retry the processing of a recording."""
+        Validator.validate_recording_name(recording_name)
+
+        status, message = self.recording_service.reprocess_recording(recording_name)
+        return ErrorHandler.handle_service_response((status, message))
+
+    @handle_api_errors
     def get_hub_data(self, recording_name: str) -> Tuple[Dict[str, Any], int]:
         """Get hub data for a recording."""
         Validator.validate_recording_name(recording_name)
